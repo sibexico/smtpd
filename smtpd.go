@@ -42,6 +42,9 @@ type MsgIDHandler func(remoteAddr net.Addr, from string, to []string, data []byt
 // HandlerRcpt function called on RCPT. Return accept status.
 type HandlerRcpt func(remoteAddr net.Addr, from string, to string) bool
 
+// HandlerVrfy function called on VRFY. Returns canonical mailbox and accept status.
+type HandlerVrfy func(remoteAddr net.Addr, address string) (string, bool)
+
 // AuthHandler function called when a login attempt is performed. Returns true if credentials are correct.
 type AuthHandler func(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error)
 
@@ -94,6 +97,7 @@ type Server struct {
 	DisableReverseDNS bool            // Disable reverse DNS lookups, enforces "unknown" hostname
 	Handler           Handler
 	HandlerRcpt       HandlerRcpt
+	HandlerVrfy       HandlerVrfy
 	Hostname          string
 	LogRead           LogFunc
 	LogWrite          LogFunc
@@ -393,9 +397,20 @@ loop:
 			} else {
 				// Validate the SIZE parameter if one was sent.
 				if len(match[2]) > 0 { // A parameter is present
-					sizeMatch := mailSizeRE.FindStringSubmatch(match[3])
+					param := strings.TrimSpace(match[3])
+					params := strings.Fields(param)
+					if len(params) != 1 {
+						s.writef("502 5.5.1 Command not implemented")
+						break
+					}
+
+					sizeMatch := mailSizeRE.FindStringSubmatch(params[0])
 					if sizeMatch == nil {
-						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+						if strings.HasPrefix(strings.ToUpper(params[0]), "SIZE") {
+							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+						} else {
+							s.writef("502 5.5.1 Command not implemented")
+						}
 					} else {
 						// Enforce the maximum message size if one is set.
 						size, err := strconv.Atoi(sizeMatch[1])
@@ -581,9 +596,60 @@ loop:
 				}
 			}
 			s.writef("250 2.0.0 Ok")
-		case "HELP", "VRFY", "EXPN":
+		case "HELP", "EXPN":
 			// See RFC 5321 section 4.2.4 for usage of 500 & 502 response codes.
 			s.writef("502 5.5.1 Command not implemented")
+		case "VRFY":
+			// Match command restrictions used elsewhere when TLS/auth is required.
+			if s.srv.TLSConfig != nil && s.srv.TLSRequired && !s.tls {
+				s.writef("530 5.7.0 Must issue a STARTTLS command first")
+				break
+			}
+			if s.srv.AuthHandler != nil && s.srv.AuthRequired && !s.authenticated {
+				s.writef("530 5.7.0 Authentication required")
+				break
+			}
+			if args == "" {
+				s.writef("501 5.5.4 Syntax error in parameters or arguments (argument required)")
+			} else {
+				// Accept either a bare mailbox or display-name form: Name <mailbox>.
+				query := strings.TrimSpace(args)
+				address := query
+				if left := strings.Index(query, "<"); left != -1 {
+					right := strings.LastIndex(query, ">")
+					if right == -1 || right <= left+1 {
+						s.writef("501 5.5.4 Syntax error in parameters or arguments (argument required)")
+						break
+					}
+					address = strings.TrimSpace(query[left+1 : right])
+				}
+				if address == "" {
+					s.writef("501 5.5.4 Syntax error in parameters or arguments (argument required)")
+					break
+				}
+
+				// Prefer explicit VRFY lookup, then fallback to RCPT policy if provided.
+				if s.srv.HandlerVrfy != nil {
+					canonical, found := s.srv.HandlerVrfy(s.conn.RemoteAddr(), address)
+					if !found {
+						s.writef("550 5.1.0 Requested action not taken: mailbox unavailable")
+					} else {
+						if strings.TrimSpace(canonical) == "" {
+							canonical = address
+						}
+						s.writef("250 2.1.5 <%s>", canonical)
+					}
+				} else if s.srv.HandlerRcpt != nil {
+					if s.srv.HandlerRcpt(s.conn.RemoteAddr(), "", address) {
+						s.writef("250 2.1.5 <%s>", address)
+					} else {
+						s.writef("550 5.1.0 Requested action not taken: mailbox unavailable")
+					}
+				} else {
+					// No verification backend: accept transaction but cannot confirm identity.
+					s.writef("252 2.1.5 Cannot VRFY user, but will accept message and attempt delivery")
+				}
+			}
 		case "STARTTLS":
 			// Parameters are not allowed (RFC 3207 section 4).
 			if args != "" {

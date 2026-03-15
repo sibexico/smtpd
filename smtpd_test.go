@@ -63,7 +63,8 @@ func TestSimpleCommands(t *testing.T) {
 		{"NOOP", "250"},
 		{"RSET", "250"},
 		{"HELP", "502"},
-		{"VRFY", "502"},
+		{"VRFY", "501"},
+		{"VRFY recipient@example.com", "252"},
 		{"EXPN", "502"},
 		{"TEST", "500"}, // Unsupported command
 		{"", "500"},     // Blank command
@@ -106,6 +107,19 @@ func TestCmdEHLO(t *testing.T) {
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 	cmdCode(t, conn, "DATA", "503")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdVRFY(t *testing.T) {
+	conn := newConn(t, &Server{})
+
+	// VRFY with no argument should return a syntax error.
+	cmdCode(t, conn, "VRFY", "501")
+
+	// VRFY with an argument should return "cannot verify".
+	cmdCode(t, conn, "VRFY recipient@example.com", "252")
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
@@ -154,9 +168,10 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
 
-	// TODO: MAIL with valid AUTH parameter should return 250 Ok
-
-	// TODO: MAIL with invalid AUTH parameter must return 501 syntax error
+	// Unsupported MAIL parameters should return 502 command not implemented.
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=sender@example.com", "502")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> FOO=bar", "502")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000 FOO=bar", "502")
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
@@ -189,6 +204,56 @@ func TestCmdMAILMaxSize(t *testing.T) {
 	cmdCode(t, conn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize+1), "552")
 
 	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdVRFYWithHandlerRcpt(t *testing.T) {
+	server := &Server{HandlerRcpt: func(remoteAddr net.Addr, from string, to string) bool {
+		return to == "recipient@example.com"
+	}}
+	conn := newConn(t, server)
+
+	// VRFY should be positive when the RCPT handler accepts the address.
+	resp := cmdCode(t, conn, "VRFY recipient@example.com", "250")
+	if !strings.Contains(resp, "<recipient@example.com>") {
+		t.Errorf("VRFY response is %s, want canonical mailbox in angle brackets", resp)
+	}
+
+	// VRFY should reject unknown recipients when the RCPT handler rejects the address.
+	cmdCode(t, conn, "VRFY unknown@example.com", "550")
+
+	// A blank argument even with angle brackets  should be rejected.
+	cmdCode(t, conn, "VRFY <>", "501")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdVRFYWithHandlerVrfy(t *testing.T) {
+	server := &Server{HandlerVrfy: func(remoteAddr net.Addr, address string) (string, bool) {
+		if address == "alias@example.com" {
+			return "recipient@example.com", true
+		}
+		return "", false
+	}}
+	conn := newConn(t, server)
+
+	// VRFY should return canonical mailbox when the VRFY handler resolves it.
+	resp := cmdCode(t, conn, "VRFY alias@example.com", "250")
+	if !strings.Contains(resp, "<recipient@example.com>") {
+		t.Errorf("VRFY response is %s, want canonical mailbox in angle brackets", resp)
+	}
+
+	// Angle-bracket input should also work.
+	resp = cmdCode(t, conn, "VRFY User Name <alias@example.com>", "250")
+	if !strings.Contains(resp, "<recipient@example.com>") {
+		t.Errorf("VRFY response is %s, want canonical mailbox in angle brackets", resp)
+	}
+
+	// Unknown recipients should be rejected.
+	cmdCode(t, conn, "VRFY unknown@example.com", "550")
+
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
 }
@@ -494,7 +559,7 @@ func TestCmdSTARTTLSRequired(t *testing.T) {
 		{"RSET", "530", "250"}, // Reset before DATA to avoid having to actually send a message.
 		{"DATA", "530", "503"},
 		{"HELP", "502", "502"},
-		{"VRFY", "502", "502"},
+		{"VRFY recipient@example.com", "530", "252"},
 		{"EXPN", "502", "502"},
 		{"TEST", "500", "500"}, // Unsupported command
 		{"", "500", "500"},     // Blank command
@@ -1031,7 +1096,7 @@ func TestCmdAUTHRequired(t *testing.T) {
 		{"RSET", "250", "250"}, // Reset before DATA to avoid having to actually send a message.
 		{"DATA", "530", "503"},
 		{"HELP", "502", "502"},
-		{"VRFY", "502", "502"},
+		{"VRFY recipient@example.com", "530", "252"},
 		{"EXPN", "502", "502"},
 		{"TEST", "500", "500"},     // Unsupported command
 		{"", "500", "500"},         // Blank command
