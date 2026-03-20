@@ -305,6 +305,34 @@ func TestCmdRCPT(t *testing.T) {
 	conn.Close()
 }
 
+func TestCmdRCPTDefaultMaxRecipientsNoMutation(t *testing.T) {
+	server := &Server{}
+	conn := newConn(t, server)
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+
+	if server.MaxRecipients != 0 {
+		t.Errorf("MaxRecipients is %d, want 0 (default should not be mutated)", server.MaxRecipients)
+	}
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdXCLIENTMalformedTrusted(t *testing.T) {
+	// net.Pipe sessions have an empty remoteIP, so allow that value to trust XCLIENT input.
+	server := &Server{XClientAllowed: []string{""}}
+	conn := newConn(t, server)
+
+	// Malformed key/value pairs should not panic and should still return a normal response.
+	cmdCode(t, conn, "XCLIENT MALFORMED", "250")
+	cmdCode(t, conn, "XCLIENT ADDR=127.0.0.1 NAME", "250")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
 func TestCmdDATA(t *testing.T) {
 	conn := newConn(t, &Server{})
 	cmdCode(t, conn, "EHLO host.example.com", "250")
@@ -970,6 +998,35 @@ func TestConfigureTLSWithPassphrase(t *testing.T) {
 	}
 	if srv.TLSConfig == nil {
 		t.Errorf("Unexpected empty TLS config.")
+	}
+}
+
+func TestConfigureTLSWithPassphraseInvalidPEM(t *testing.T) {
+	certFile, err := createTmpFile("-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----")
+	if err != nil {
+		t.Errorf("Unexpected cert file creation error: %s", err)
+		return
+	}
+	keyFile, err := createTmpFile("not-a-pem-block")
+	if err != nil {
+		t.Errorf("Unexpected key file creation error: %s", err)
+		return
+	}
+	defer func() {
+		os.Remove(certFile.Name())
+		os.Remove(keyFile.Name())
+	}()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("ConfigureTLSWithPassphrase panicked on invalid PEM: %v", r)
+		}
+	}()
+
+	srv := &Server{}
+	err = srv.ConfigureTLSWithPassphrase(certFile.Name(), keyFile.Name(), "test")
+	if err == nil {
+		t.Errorf("Expected error for invalid PEM input")
 	}
 }
 
@@ -1666,4 +1723,33 @@ func TestCmdShutdown(t *testing.T) {
 	}
 
 	conn.Close()
+}
+
+func TestServeReturnsOnShutdown(t *testing.T) {
+	srv := &Server{}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() returned error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("Serve() returned %v, want %v", err, ErrServerClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Serve() did not return after shutdown")
+	}
 }

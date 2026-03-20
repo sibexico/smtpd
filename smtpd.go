@@ -113,6 +113,7 @@ type Server struct {
 	openSessions int32 // count of open sessions
 	mu           sync.Mutex
 	shutdownChan chan struct{} // let the sessions know we are shutting down
+	listeners    map[net.Listener]struct{}
 
 	XClientAllowed []string // List of XCLIENT allowed IP addresses
 }
@@ -143,6 +144,9 @@ func (srv *Server) ConfigureTLSWithPassphrase(
 		return err
 	}
 	keyDERBlock, _ := pem.Decode(keyPEMBlock)
+	if keyDERBlock == nil {
+		return errors.New("failed to decode encrypted private key PEM block")
+	}
 	keyPEMDecrypted, err := x509.DecryptPEMBlock(keyDERBlock, []byte(passphrase))
 	if err != nil {
 		return err
@@ -201,6 +205,8 @@ func (srv *Server) Serve(ln net.Listener) error {
 		return ErrServerClosed
 	}
 
+	srv.addListener(ln)
+	defer srv.removeListener(ln)
 	defer ln.Close()
 	for {
 
@@ -213,6 +219,9 @@ func (srv *Server) Serve(ln net.Listener) error {
 
 		conn, err := ln.Accept()
 		if err != nil {
+			if atomic.LoadInt32(&srv.inShutdown) != 0 {
+				return ErrServerClosed
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
 				continue
 			}
@@ -222,6 +231,37 @@ func (srv *Server) Serve(ln net.Listener) error {
 		session := srv.newSession(conn)
 		atomic.AddInt32(&srv.openSessions, 1)
 		go session.serve()
+	}
+}
+
+func (srv *Server) addListener(ln net.Listener) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.listeners == nil {
+		srv.listeners = make(map[net.Listener]struct{})
+	}
+	srv.listeners[ln] = struct{}{}
+}
+
+func (srv *Server) removeListener(ln net.Listener) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.listeners == nil {
+		return
+	}
+	delete(srv.listeners, ln)
+}
+
+func (srv *Server) closeListeners() {
+	srv.mu.Lock()
+	listeners := make([]net.Listener, 0, len(srv.listeners))
+	for ln := range srv.listeners {
+		listeners = append(listeners, ln)
+	}
+	srv.mu.Unlock()
+
+	for _, ln := range listeners {
+		_ = ln.Close()
 	}
 }
 
@@ -302,6 +342,7 @@ func (srv *Server) closeShutdownChan() {
 func (srv *Server) Close() error {
 	atomic.StoreInt32(&srv.inShutdown, 1)
 	srv.closeShutdownChan()
+	srv.closeListeners()
 	return nil
 }
 
@@ -309,6 +350,7 @@ func (srv *Server) Close() error {
 func (srv *Server) Shutdown(ctx context.Context) error {
 	atomic.StoreInt32(&srv.inShutdown, 1)
 	srv.closeShutdownChan()
+	srv.closeListeners()
 
 	// wait for up to 30 seconds to allow the current sessions to
 	// end
@@ -452,10 +494,12 @@ loop:
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)")
 			} else {
 				// RFC 5321 specifies support for minimum of 100 recipients is required.
-				if s.srv.MaxRecipients == 0 {
-					s.srv.MaxRecipients = 100
+				maxRecipients := s.srv.MaxRecipients
+				if maxRecipients == 0 {
+					// Use a per-command default so sessions don't mutate shared server config.
+					maxRecipients = 100
 				}
-				if len(to) == s.srv.MaxRecipients {
+				if len(to) == maxRecipients {
 					s.writef("452 4.5.3 Too many recipients")
 				} else {
 					accept := true
@@ -571,13 +615,19 @@ loop:
 			if s.xClientTrust {
 				xCArgs := strings.Split(args, " ")
 				for _, xCArg := range xCArgs {
-					xCParse := strings.Split(strings.TrimSpace(xCArg), "=")
-					if strings.ToUpper(xCParse[0]) == "ADDR" && (net.ParseIP(xCParse[1]) != nil) {
-						s.xClientADDR = xCParse[1]
+					xCParse := strings.SplitN(strings.TrimSpace(xCArg), "=", 2)
+					if len(xCParse) != 2 {
+						continue
 					}
-					if strings.ToUpper(xCParse[0]) == "NAME" && len(xCParse[1]) > 0 {
-						if xCParse[1] != "[UNAVAILABLE]" {
-							s.xClientNAME = xCParse[1]
+
+					key := strings.ToUpper(xCParse[0])
+					value := xCParse[1]
+					if key == "ADDR" && net.ParseIP(value) != nil {
+						s.xClientADDR = value
+					}
+					if key == "NAME" && len(value) > 0 {
+						if value != "[UNAVAILABLE]" {
+							s.xClientNAME = value
 						}
 					}
 				}
