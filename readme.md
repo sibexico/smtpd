@@ -38,7 +38,7 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Han
 The handler function must have the following definition:
 
 ```go
-func handler(remoteAddr net.Addr, from string, to []string, data []byte)
+func handler(remoteAddr net.Addr, from string, to []string, data []byte) error
 ```
 
 The parameters are:

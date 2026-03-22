@@ -894,7 +894,10 @@ func (s *session) readData() ([]byte, error) {
 		// Enforce the maximum message size limit.
 		if s.srv.MaxSize > 0 {
 			if len(data)+len(line) > s.srv.MaxSize {
-				_, _ = s.br.Discard(s.br.Buffered()) // Discard the buffer remnants.
+				// Drain the remainder of the DATA block to keep the command stream in sync.
+				if err := s.discardDataRemainder(); err != nil {
+					return nil, err
+				}
 				return nil, maxSizeExceeded(s.srv.MaxSize)
 			}
 		}
@@ -902,6 +905,23 @@ func (s *session) readData() ([]byte, error) {
 		data = append(data, line...)
 	}
 	return data, nil
+}
+
+// Read and discard remaining DATA lines until the SMTP terminator line is found.
+func (s *session) discardDataRemainder() error {
+	for {
+		if s.srv.Timeout > 0 {
+			s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
+		}
+
+		line, err := s.br.ReadBytes('\n')
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(line, []byte(".\r\n")) {
+			return nil
+		}
+	}
 }
 
 // Create the Received header to comply with RFC 2821 section 3.8.2.

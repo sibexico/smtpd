@@ -400,6 +400,33 @@ func TestCmdDATAWithMaxSize(t *testing.T) {
 	conn.Close()
 }
 
+func TestCmdDATAWithMaxSizeKeepsCommandStreamSynchronized(t *testing.T) {
+	conn := newConn(t, &Server{MaxSize: 10})
+	defer conn.Close()
+
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+
+	// Send an oversized line first, then terminate DATA separately.
+	fmt.Fprintf(conn, "%s\r\n", "this line is too long")
+	time.Sleep(20 * time.Millisecond)
+	fmt.Fprintf(conn, ".\r\n")
+
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read response from test server: %v", err)
+	}
+	if resp[0:3] != "552" {
+		t.Fatalf("DATA oversize response code is %s, want 552", resp[0:3])
+	}
+
+	// Subsequent commands should not be contaminated by leftover DATA bytes.
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "QUIT", "221")
+}
+
 type mockHandler struct {
 	handlerCalled int
 }
