@@ -31,6 +31,17 @@ var (
 	mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
 )
 
+const (
+	// RFC 5321 section 4.5.3.1.4 limits command and reply lines to 512 octets including CRLF.
+	maxCommandLineLength = 512
+
+	// RFC 5321 section 4.5.3.1.6 limits text lines to 1000 octets including CRLF.
+	maxTextLineLength = 1000
+
+	// RFC 5321 section 4.5.3.1.3 limits reverse-path and forward-path to 256 octets including punctuation.
+	maxPathLength = 256
+)
+
 // Handler function called upon successful receipt of an email.
 // Results in a "250 2.0.0 Ok: queued" response.
 type Handler func(remoteAddr net.Addr, from string, to []string, data []byte) error
@@ -74,14 +85,30 @@ type maxSizeExceededError struct {
 	limit int
 }
 
+type maxLineExceededError struct {
+	limit int
+	kind  string
+}
+
 func maxSizeExceeded(limit int) maxSizeExceededError {
 	return maxSizeExceededError{limit}
+}
+
+func maxLineExceeded(limit int, kind string) maxLineExceededError {
+	return maxLineExceededError{limit: limit, kind: kind}
 }
 
 // Error uses the RFC 5321 response message in preference to RFC 1870.
 // RFC 3463 defines enhanced status code x.3.4 as "Message too big for system".
 func (err maxSizeExceededError) Error() string {
 	return fmt.Sprintf("552 5.3.4 Requested mail action aborted: exceeded storage allocation (%d)", err.limit)
+}
+
+func (err maxLineExceededError) Error() string {
+	if err.kind == "command" {
+		return fmt.Sprintf("500 5.5.2 Syntax error: line too long (maximum %d octets including CRLF)", err.limit)
+	}
+	return fmt.Sprintf("500 5.5.2 Syntax error: text line too long (maximum %d octets including CRLF)", err.limit)
 }
 
 // LogFunc is a function capable of logging the client-server communication.
@@ -396,6 +423,10 @@ loop:
 		// On error, assume the client has gone away i.e. return from serve().
 		line, err := s.readLine()
 		if err != nil {
+			if _, ok := err.(maxLineExceededError); ok {
+				s.writef(err.Error())
+				continue
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 			}
@@ -406,6 +437,10 @@ loop:
 
 		switch verb {
 		case "HELO":
+			if args == "" {
+				s.writef("501 5.5.4 Syntax error in parameters or arguments (domain/address required)")
+				break
+			}
 			s.remoteName = args
 			s.writef("250 %s greets %s", s.srv.Hostname, s.remoteName)
 
@@ -415,6 +450,10 @@ loop:
 			to = nil
 			buffer.Reset()
 		case "EHLO":
+			if args == "" {
+				s.writef("501 5.5.4 Syntax error in parameters or arguments (domain/address required)")
+				break
+			}
 			s.remoteName = args
 			s.writef(s.makeEHLOResponse())
 
@@ -437,6 +476,11 @@ loop:
 			if match == nil {
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
 			} else {
+				if len(match[1]) > maxPathLength {
+					s.writef("501 5.5.4 Syntax error in parameters or arguments (FROM path exceeds maximum length)")
+					break
+				}
+
 				// Validate the SIZE parameter if one was sent.
 				if len(match[2]) > 0 { // A parameter is present
 					param := strings.TrimSpace(match[3])
@@ -493,6 +537,11 @@ loop:
 			if match == nil {
 				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)")
 			} else {
+				if len(match[1]) > maxPathLength {
+					s.writef("501 5.5.4 Syntax error in parameters or arguments (TO path exceeds maximum length)")
+					break
+				}
+
 				// RFC 5321 specifies support for minimum of 100 recipients is required.
 				maxRecipients := s.srv.MaxRecipients
 				if maxRecipients == 0 {
@@ -543,6 +592,9 @@ loop:
 					}
 					break loop
 				case maxSizeExceededError:
+					s.writef(err.Error())
+					continue
+				case maxLineExceededError:
 					s.writef(err.Error())
 					continue
 				default:
@@ -844,6 +896,9 @@ func (s *session) readLine() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if len(line) > maxCommandLineLength {
+		return "", maxLineExceeded(maxCommandLineLength, "command")
+	}
 	line = strings.TrimSpace(line) // Strip trailing \r\n
 
 	if Debug {
@@ -881,6 +936,12 @@ func (s *session) readData() ([]byte, error) {
 		line, err := s.br.ReadBytes('\n')
 		if err != nil {
 			return nil, err
+		}
+		if len(line) > maxTextLineLength {
+			if err := s.discardDataRemainder(); err != nil {
+				return nil, err
+			}
+			return nil, maxLineExceeded(maxTextLineLength, "text")
 		}
 		// Handle end of data denoted by lone period (\r\n.\r\n)
 		if bytes.Equal(line, []byte(".\r\n")) {

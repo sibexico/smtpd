@@ -95,6 +95,16 @@ func TestCmdHELO(t *testing.T) {
 	conn.Close()
 }
 
+func TestCmdHELORequiresArgument(t *testing.T) {
+	conn := newConn(t, &Server{})
+
+	// HELO without an argument should return a syntax error.
+	cmdCode(t, conn, "HELO", "501")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
 func TestCmdEHLO(t *testing.T) {
 	conn := newConn(t, &Server{})
 
@@ -107,6 +117,16 @@ func TestCmdEHLO(t *testing.T) {
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
 	cmdCode(t, conn, "EHLO host.example.com", "250")
 	cmdCode(t, conn, "DATA", "503")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdEHLORequiresArgument(t *testing.T) {
+	conn := newConn(t, &Server{})
+
+	// EHLO without an argument should return a syntax error.
+	cmdCode(t, conn, "EHLO", "501")
 
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
@@ -204,6 +224,21 @@ func TestCmdMAILMaxSize(t *testing.T) {
 	cmdCode(t, conn, fmt.Sprintf("MAIL FROM:<sender@example.com> SIZE=%d", maxSize+1), "552")
 
 	// Clients should send either RSET or QUIT after receiving 552 (RFC 1870 section 6.2).
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdMAILPathTooLong(t *testing.T) {
+	conn := newConn(t, &Server{})
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+
+	// Paths above 256 octets should return 501 syntax error.
+	tooLong := strings.Repeat("a", 257)
+	cmdCode(t, conn, fmt.Sprintf("MAIL FROM:<%s>", tooLong), "501")
+
+	// The session should still accept a valid MAIL command afterwards.
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+
 	cmdCode(t, conn, "QUIT", "221")
 	conn.Close()
 }
@@ -320,6 +355,35 @@ func TestCmdRCPTDefaultMaxRecipientsNoMutation(t *testing.T) {
 	conn.Close()
 }
 
+func TestCmdRCPTPathTooLong(t *testing.T) {
+	conn := newConn(t, &Server{})
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+
+	// Paths above 256 octets should return 501 syntax error.
+	tooLong := strings.Repeat("a", 257)
+	cmdCode(t, conn, fmt.Sprintf("RCPT TO:<%s>", tooLong), "501")
+
+	// The session should still accept a valid RCPT command afterwards.
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
+func TestCmdCommandLineTooLong(t *testing.T) {
+	conn := newConn(t, &Server{})
+
+	// Commands above 512 octets including CRLF should return a line-too-long syntax error.
+	overlong := strings.Repeat("A", 511)
+	cmdCode(t, conn, overlong, "500")
+
+	// Subsequent commands should still work.
+	cmdCode(t, conn, "NOOP", "250")
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+}
+
 func TestCmdXCLIENTMalformedTrusted(t *testing.T) {
 	// net.Pipe sessions have an empty remoteIP, so allow that value to trust XCLIENT input.
 	server := &Server{XClientAllowed: []string{""}}
@@ -420,6 +484,33 @@ func TestCmdDATAWithMaxSizeKeepsCommandStreamSynchronized(t *testing.T) {
 	}
 	if resp[0:3] != "552" {
 		t.Fatalf("DATA oversize response code is %s, want 552", resp[0:3])
+	}
+
+	// Subsequent commands should not be contaminated by leftover DATA bytes.
+	cmdCode(t, conn, "RSET", "250")
+	cmdCode(t, conn, "QUIT", "221")
+}
+
+func TestCmdDATAWithLineTooLongKeepsCommandStreamSynchronized(t *testing.T) {
+	conn := newConn(t, &Server{})
+	defer conn.Close()
+
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "DATA", "354")
+
+	// Send one line above 1000 octets including CRLF, then terminate DATA separately.
+	fmt.Fprintf(conn, "%s\r\n", strings.Repeat("a", 999))
+	time.Sleep(20 * time.Millisecond)
+	fmt.Fprintf(conn, ".\r\n")
+
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read response from test server: %v", err)
+	}
+	if resp[0:3] != "500" {
+		t.Fatalf("DATA long-line response code is %s, want 500", resp[0:3])
 	}
 
 	// Subsequent commands should not be contaminated by leftover DATA bytes.
@@ -711,6 +802,14 @@ func TestReadLine(t *testing.T) {
 	} else if output != cmd {
 		t.Errorf("readLine(%v) returned %v, want %v", line, output, cmd)
 	}
+
+	// Ensure command lines above 512 octets including CRLF are rejected.
+	overlong := strings.Repeat("A", 511) + "\r\n"
+	buf.Write([]byte(overlong))
+	_, err = s.readLine()
+	if err == nil {
+		t.Errorf("readLine() with overlong command line returned no error")
+	}
 }
 
 // Test reading of message data, including dot stuffing (see RFC 5321 section 4.5.2).
@@ -786,6 +885,20 @@ func TestReadDataWithMaxSize(t *testing.T) {
 		if err != tt.err {
 			t.Errorf("readData(%v) returned err: %v", tt.lines, tt.err)
 		}
+	}
+}
+
+func TestReadDataLineTooLong(t *testing.T) {
+	var buf bytes.Buffer
+	s := &session{}
+	s.srv = &Server{}
+	s.br = bufio.NewReader(&buf)
+
+	// Lines above 1000 octets including CRLF should return a line-too-long error.
+	buf.Write([]byte(strings.Repeat("a", 999) + "\r\n.\r\n"))
+	_, err := s.readData()
+	if err == nil {
+		t.Errorf("readData() with overlong text line returned no error")
 	}
 }
 
