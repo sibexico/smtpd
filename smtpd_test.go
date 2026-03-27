@@ -743,6 +743,60 @@ func TestCmdSTARTTLSRequired(t *testing.T) {
 	tlsConn.Close()
 }
 
+func TestCmdSTARTTLSRejectsTLS11Client(t *testing.T) {
+	srv := &Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to connect to server: %v", err)
+	}
+	defer conn.Close()
+
+	banner, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read banner from test server: %v", err)
+	}
+	if banner[0:3] != "220" {
+		t.Fatalf("Read incorrect banner from test server: %v", banner)
+	}
+
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "STARTTLS", "220")
+
+	// Modern TLS defaults should reject legacy TLS 1.1 handshakes.
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS11})
+	err = tlsConn.Handshake()
+	if err == nil {
+		t.Fatal("TLS handshake succeeded using TLS 1.1, want failure")
+	}
+	tlsConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() returned error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("Serve() returned %v, want %v", err, ErrServerClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Serve() did not return after shutdown")
+	}
+}
+
 func TestMakeHeaders(t *testing.T) {
 	now := time.Now().Format("Mon, _2 Jan 2006 15:04:05 -0700 (MST)")
 	valid := "Received: from clientName (clientHost [clientIP])\r\n" +
@@ -1167,6 +1221,31 @@ func TestConfigureTLSWithPassphraseInvalidPEM(t *testing.T) {
 	err = srv.ConfigureTLSWithPassphrase(certFile.Name(), keyFile.Name(), "test")
 	if err == nil {
 		t.Errorf("Expected error for invalid PEM input")
+	}
+}
+
+func TestSecureTLSConfigDefaults(t *testing.T) {
+	tlsConfig := secureTLSConfig(&tls.Config{})
+
+	if tlsConfig.MinVersion != tls.VersionTLS12 {
+		t.Errorf("secureTLSConfig() MinVersion is %v, want %v", tlsConfig.MinVersion, tls.VersionTLS12)
+	}
+	if !tlsConfig.PreferServerCipherSuites {
+		t.Errorf("secureTLSConfig() PreferServerCipherSuites is false, want true")
+	}
+	if len(tlsConfig.CipherSuites) == 0 {
+		t.Errorf("secureTLSConfig() returned empty CipherSuites")
+	}
+	if len(tlsConfig.CurvePreferences) == 0 {
+		t.Errorf("secureTLSConfig() returned empty CurvePreferences")
+	}
+}
+
+func TestSecureTLSConfigPreservesModernMinVersion(t *testing.T) {
+	tlsConfig := secureTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13})
+
+	if tlsConfig.MinVersion != tls.VersionTLS13 {
+		t.Errorf("secureTLSConfig() MinVersion is %v, want %v", tlsConfig.MinVersion, tls.VersionTLS13)
 	}
 }
 
@@ -1891,5 +1970,69 @@ func TestServeReturnsOnShutdown(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("Serve() did not return after shutdown")
+	}
+}
+
+func TestServeImplicitTLSListener(t *testing.T) {
+	srv := &Server{
+		Addr:        "127.0.0.1:0",
+		TLSConfig:   &tls.Config{Certificates: []tls.Certificate{cert}},
+		TLSListener: true,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	var addr string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		for ln := range srv.listeners {
+			addr = ln.Addr().String()
+			break
+		}
+		srv.mu.Unlock()
+		if addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if addr == "" {
+		t.Fatalf("Failed to discover listener address for implicit TLS server")
+	}
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("Failed to connect to implicit TLS server: %v", err)
+	}
+
+	banner, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read banner from implicit TLS server: %v", err)
+	}
+	if banner[0:3] != "220" {
+		t.Fatalf("Read incorrect banner from implicit TLS server: %v", banner)
+	}
+
+	cmdCode(t, conn, "EHLO host.example.com", "250")
+	cmdCode(t, conn, "QUIT", "221")
+	conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() returned error: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("ListenAndServe() returned %v, want %v", err, ErrServerClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ListenAndServe() did not return after shutdown")
 	}
 }

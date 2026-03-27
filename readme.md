@@ -1,5 +1,7 @@
 # smtpd
 
+> Maintenance note: the original repository is no longer being actively updated and is not accepting PRs. The fork has been adopted by [github.com/sibexico](https://github.com/sibexico), and it will continue to be updated and improved here. This README will be rewritten soon.
+
 An SMTP server package written in Go, in the style of the built-in HTTP server. It meets the minimum requirements specified by RFC 2821 & 5321.
 
 It is based on [Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtpd). The differences can be summarised as:

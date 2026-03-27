@@ -81,6 +81,28 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Han
 	return srv.ListenAndServe()
 }
 
+// ListenAndServeSTARTTLS listens on the TCP network address addr
+// and requires STARTTLS before accepting mail commands, commonly used on port 587.
+func ListenAndServeSTARTTLS(addr string, certFile string, keyFile string, handler Handler, appname string, hostname string) error {
+	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname, TLSRequired: true}
+	err := srv.ConfigureTLS(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	return srv.ListenAndServe()
+}
+
+// ListenAndServeTLSImplicit listens on the TCP network address addr
+// and serves SMTP over implicit TLS (SMTPS), commonly used on port 465.
+func ListenAndServeTLSImplicit(addr string, certFile string, keyFile string, handler Handler, appname string, hostname string) error {
+	srv := &Server{Addr: addr, Handler: handler, Appname: appname, Hostname: hostname, TLSListener: true}
+	err := srv.ConfigureTLS(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+	return srv.ListenAndServe()
+}
+
 type maxSizeExceededError struct {
 	limit int
 }
@@ -151,7 +173,7 @@ func (srv *Server) ConfigureTLS(certFile string, keyFile string) error {
 	if err != nil {
 		return err
 	}
-	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.TLSConfig = secureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}})
 	return nil
 }
 
@@ -186,8 +208,41 @@ func (srv *Server) ConfigureTLSWithPassphrase(
 	if err != nil {
 		return err
 	}
-	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.TLSConfig = secureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}})
 	return nil
+}
+
+// Create a cloned TLS config with secure defaults for SMTP.
+func secureTLSConfig(config *tls.Config) *tls.Config {
+	if config == nil {
+		return nil
+	}
+
+	tlsConfig := config.Clone()
+
+	// Enforce modern protocol versions and disable SSLv3/TLS 1.0/TLS 1.1.
+	if tlsConfig.MinVersion == 0 || tlsConfig.MinVersion < tls.VersionTLS12 {
+		tlsConfig.MinVersion = tls.VersionTLS12
+	}
+
+	// Let the server choose cipher preference and ensure a strong default set.
+	tlsConfig.PreferServerCipherSuites = true
+	if len(tlsConfig.CipherSuites) == 0 {
+		tlsConfig.CipherSuites = []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		}
+	}
+
+	if len(tlsConfig.CurvePreferences) == 0 {
+		tlsConfig.CurvePreferences = []tls.CurveID{tls.X25519, tls.CurveP256}
+	}
+
+	return tlsConfig
 }
 
 // ListenAndServe listens on the TCP network address srv.Addr and then
@@ -216,7 +271,7 @@ func (srv *Server) ListenAndServe() error {
 
 	// If TLSListener is enabled, listen for TLS connections only.
 	if srv.TLSConfig != nil && srv.TLSListener {
-		ln, err = tls.Listen("tcp", srv.Addr, srv.TLSConfig)
+		ln, err = tls.Listen("tcp", srv.Addr, secureTLSConfig(srv.TLSConfig))
 	} else {
 		ln, err = net.Listen("tcp", srv.Addr)
 	}
@@ -774,7 +829,7 @@ loop:
 			s.writef("220 2.0.0 Ready to start TLS")
 
 			// Establish a TLS connection with the client.
-			tlsConn := tls.Server(s.conn, s.srv.TLSConfig)
+			tlsConn := tls.Server(s.conn, secureTLSConfig(s.srv.TLSConfig))
 			err := tlsConn.Handshake()
 			if err != nil {
 				s.writef("403 4.7.0 TLS handshake failed")
