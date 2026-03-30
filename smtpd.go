@@ -25,10 +25,7 @@ import (
 
 var (
 	// Debug `true` enables verbose logging.
-	Debug      = false
-	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:\s?<(.+)>`)
-	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:\s?<(.*)>(\s(.*))?`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
-	mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
+	Debug = false
 )
 
 const (
@@ -363,6 +360,20 @@ type session struct {
 	authenticated bool
 }
 
+type mailCmd struct {
+	from    string
+	size    int
+	hasSize bool
+	ret     string
+	envid   string
+}
+
+type rcptCmd struct {
+	to     string
+	notify string
+	orcpt  string
+}
+
 // Create new session from connection.
 func (srv *Server) newSession(conn net.Conn) (s *session) {
 	s = &session{
@@ -527,47 +538,15 @@ loop:
 				break
 			}
 
-			match := mailFromRE.FindStringSubmatch(args)
-			if match == nil {
-				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)")
+			mail, parseErr := parseMailCommand(args)
+			if parseErr != "" {
+				s.writef(parseErr)
 			} else {
-				if len(match[1]) > maxPathLength {
-					s.writef("501 5.5.4 Syntax error in parameters or arguments (FROM path exceeds maximum length)")
-					break
-				}
-
-				// Validate the SIZE parameter if one was sent.
-				if len(match[2]) > 0 { // A parameter is present
-					param := strings.TrimSpace(match[3])
-					params := strings.Fields(param)
-					if len(params) != 1 {
-						s.writef("502 5.5.1 Command not implemented")
-						break
-					}
-
-					sizeMatch := mailSizeRE.FindStringSubmatch(params[0])
-					if sizeMatch == nil {
-						if strings.HasPrefix(strings.ToUpper(params[0]), "SIZE") {
-							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
-						} else {
-							s.writef("502 5.5.1 Command not implemented")
-						}
-					} else {
-						// Enforce the maximum message size if one is set.
-						size, err := strconv.Atoi(sizeMatch[1])
-						if err != nil { // Bad SIZE parameter
-							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
-						} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
-							err = maxSizeExceeded(s.srv.MaxSize)
-							s.writef(err.Error())
-						} else { // SIZE ok
-							from = match[1]
-							gotFrom = true
-							s.writef("250 2.1.0 Ok")
-						}
-					}
-				} else { // No parameters after FROM
-					from = match[1]
+				if s.srv.MaxSize > 0 && mail.hasSize && mail.size > s.srv.MaxSize {
+					err = maxSizeExceeded(s.srv.MaxSize)
+					s.writef(err.Error())
+				} else {
+					from = mail.from
 					gotFrom = true
 					s.writef("250 2.1.0 Ok")
 				}
@@ -588,15 +567,10 @@ loop:
 				break
 			}
 
-			match := rcptToRE.FindStringSubmatch(args)
-			if match == nil {
-				s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)")
+			rcpt, parseErr := parseRcptCommand(args)
+			if parseErr != "" {
+				s.writef(parseErr)
 			} else {
-				if len(match[1]) > maxPathLength {
-					s.writef("501 5.5.4 Syntax error in parameters or arguments (TO path exceeds maximum length)")
-					break
-				}
-
 				// RFC 5321 specifies support for minimum of 100 recipients is required.
 				maxRecipients := s.srv.MaxRecipients
 				if maxRecipients == 0 {
@@ -608,10 +582,10 @@ loop:
 				} else {
 					accept := true
 					if s.srv.HandlerRcpt != nil {
-						accept = s.srv.HandlerRcpt(s.conn.RemoteAddr(), from, match[1])
+						accept = s.srv.HandlerRcpt(s.conn.RemoteAddr(), from, rcpt.to)
 					}
 					if accept {
-						to = append(to, match[1])
+						to = append(to, rcpt.to)
 						s.writef("250 2.1.5 Ok")
 					} else {
 						s.writef("550 5.1.0 Requested action not taken: mailbox unavailable")
@@ -640,9 +614,9 @@ loop:
 			// On other errors, allow the client to try again.
 			data, err := s.readData()
 			if err != nil {
-				switch err.(type) {
+				switch err := err.(type) {
 				case net.Error:
-					if err.(net.Error).Timeout() {
+					if err.Timeout() {
 						s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 					}
 					break loop
@@ -980,6 +954,257 @@ func (s *session) parseLine(line string) (verb string, args string) {
 	return verb, args
 }
 
+func parsePathAndParams(args string, key string) (path string, params []string, ok bool) {
+	prefix := key + ":"
+	if len(args) < len(prefix) || !strings.EqualFold(args[:len(prefix)], prefix) {
+		return "", nil, false
+	}
+
+	rest := args[len(prefix):]
+	if rest == "" {
+		return "", nil, false
+	}
+
+	// Tolerate a single space after the colon for compatibility.
+	if rest[0] == ' ' {
+		if len(rest) < 2 || rest[1] == ' ' {
+			return "", nil, false
+		}
+		rest = rest[1:]
+	}
+
+	if rest == "" || rest[0] != '<' {
+		return "", nil, false
+	}
+
+	end := strings.IndexByte(rest, '>')
+	if end < 1 {
+		return "", nil, false
+	}
+
+	path = rest[1:end]
+	tail := rest[end+1:]
+	if tail == "" {
+		return path, nil, true
+	}
+
+	if tail[0] != ' ' {
+		return "", nil, false
+	}
+
+	tail = strings.TrimSpace(tail)
+	if tail == "" {
+		return path, nil, true
+	}
+
+	return path, strings.Fields(tail), true
+}
+
+func splitEsmtpParam(param string) (key string, value string, ok bool) {
+	i := strings.IndexByte(param, '=')
+	if i <= 0 {
+		return "", "", false
+	}
+
+	key = strings.ToUpper(param[:i])
+	value = param[i+1:]
+	if key == "" {
+		return "", "", false
+	}
+
+	return key, value, true
+}
+
+func isASCIIPrintableNoSpace(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b < 33 || b > 126 {
+			return false
+		}
+	}
+	return true
+}
+
+func validNotifyValue(value string) bool {
+	upper := strings.ToUpper(value)
+	if upper == "NEVER" {
+		return true
+	}
+
+	allowed := map[string]bool{"SUCCESS": true, "FAILURE": true, "DELAY": true}
+	seen := map[string]bool{}
+	parts := strings.Split(upper, ",")
+	if len(parts) == 0 {
+		return false
+	}
+
+	for _, part := range parts {
+		if part == "" || !allowed[part] {
+			return false
+		}
+		if seen[part] {
+			return false
+		}
+		seen[part] = true
+	}
+
+	return true
+}
+
+func validOrcptValue(value string) bool {
+	sep := strings.IndexByte(value, ';')
+	if sep <= 0 || sep == len(value)-1 {
+		return false
+	}
+
+	addrType := value[:sep]
+	xtext := value[sep+1:]
+	if !isASCIIPrintableNoSpace(xtext) {
+		return false
+	}
+
+	for i := 0; i < len(addrType); i++ {
+		b := addrType[i]
+		if !((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '-') {
+			return false
+		}
+	}
+
+	return true
+}
+
+func parseMailCommand(args string) (cmd mailCmd, errResp string) {
+	from, params, ok := parsePathAndParams(args, "FROM")
+	if !ok {
+		return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid FROM parameter)"
+	}
+
+	if len(from) > maxPathLength {
+		return cmd, "501 5.5.4 Syntax error in parameters or arguments (FROM path exceeds maximum length)"
+	}
+
+	cmd.from = from
+	seen := map[string]bool{}
+
+	for _, param := range params {
+		key, value, hasKV := splitEsmtpParam(param)
+		if !hasKV {
+			switch strings.ToUpper(param) {
+			case "SIZE":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)"
+			case "RET":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid RET parameter)"
+			case "ENVID":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid ENVID parameter)"
+			default:
+				return cmd, "502 5.5.1 Command not implemented"
+			}
+		}
+
+		if seen[key] {
+			switch key {
+			case "SIZE":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)"
+			case "RET":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid RET parameter)"
+			case "ENVID":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid ENVID parameter)"
+			default:
+				return cmd, "502 5.5.1 Command not implemented"
+			}
+		}
+
+		switch key {
+		case "SIZE":
+			size, err := strconv.Atoi(value)
+			if err != nil || size < 0 {
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)"
+			}
+			cmd.hasSize = true
+			cmd.size = size
+		case "RET":
+			ret := strings.ToUpper(value)
+			if ret != "FULL" && ret != "HDRS" {
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid RET parameter)"
+			}
+			cmd.ret = ret
+		case "ENVID":
+			if len(value) > 100 || !isASCIIPrintableNoSpace(value) {
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid ENVID parameter)"
+			}
+			cmd.envid = value
+		default:
+			return cmd, "502 5.5.1 Command not implemented"
+		}
+
+		seen[key] = true
+	}
+
+	return cmd, ""
+}
+
+func parseRcptCommand(args string) (cmd rcptCmd, errResp string) {
+	to, params, ok := parsePathAndParams(args, "TO")
+	if !ok {
+		return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid TO parameter)"
+	}
+
+	if len(to) > maxPathLength {
+		return cmd, "501 5.5.4 Syntax error in parameters or arguments (TO path exceeds maximum length)"
+	}
+
+	cmd.to = to
+	seen := map[string]bool{}
+
+	for _, param := range params {
+		key, value, hasKV := splitEsmtpParam(param)
+		if !hasKV {
+			switch strings.ToUpper(param) {
+			case "NOTIFY":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid NOTIFY parameter)"
+			case "ORCPT":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid ORCPT parameter)"
+			default:
+				return cmd, "502 5.5.1 Command not implemented"
+			}
+		}
+
+		if seen[key] {
+			switch key {
+			case "NOTIFY":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid NOTIFY parameter)"
+			case "ORCPT":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid ORCPT parameter)"
+			default:
+				return cmd, "502 5.5.1 Command not implemented"
+			}
+		}
+
+		switch key {
+		case "NOTIFY":
+			if !validNotifyValue(value) {
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid NOTIFY parameter)"
+			}
+			cmd.notify = strings.ToUpper(value)
+		case "ORCPT":
+			if !validOrcptValue(value) {
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid ORCPT parameter)"
+			}
+			cmd.orcpt = value
+		default:
+			return cmd, "502 5.5.1 Command not implemented"
+		}
+
+		seen[key] = true
+	}
+
+	return cmd, ""
+}
+
 // Read the message data following a DATA command.
 func (s *session) readData() ([]byte, error) {
 	var data []byte
@@ -1073,6 +1298,9 @@ func (s *session) makeEHLOResponse() (response string) {
 
 	// RFC 1870 specifies that "SIZE 0" indicates no maximum size is in force.
 	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
+
+	// RFC 3461 Delivery Status Notification extension.
+	response += "250-DSN\r\n"
 
 	// Only list STARTTLS if TLS is configured, but not currently in use.
 	if s.srv.TLSConfig != nil && !s.tls {

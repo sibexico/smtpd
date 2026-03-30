@@ -181,12 +181,19 @@ func TestCmdMAIL(t *testing.T) {
 
 	// MAIL with valid SIZE parameter should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET=FULL", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET=HDRS ENVID=track-123 SIZE=1000", "250")
 
 	// MAIL with bad size parameter should return 501 syntax error
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000 SIZE=1001", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET=ALL", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> ENVID", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> ENVID=", "501")
 
 	// Unsupported MAIL parameters should return 502 command not implemented.
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> AUTH=sender@example.com", "502")
@@ -325,6 +332,17 @@ func TestCmdRCPT(t *testing.T) {
 	cmdCode(t, conn, "RSET", "250")
 	cmdCode(t, conn, "MAIL FROM:<>", "250")
 	cmdCode(t, conn, "RCPT TO:<recipient@example.com>", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;recipient@example.com", "250")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> NOTIFY=NEVER", "250")
+
+	// Bad DSN parameters should return 501 syntax error.
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> NOTIFY", "501")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> NOTIFY=SUCCESS,NEVER", "501")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> ORCPT=rfc822", "501")
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> ORCPT=;recipient@example.com", "501")
+
+	// Unsupported RCPT parameters should return 502 command not implemented.
+	cmdCode(t, conn, "RCPT TO:<recipient@example.com> FOO=bar", "502")
 
 	// RCPT with seemingly valid but noncompliant TO arg (single space after the colon) should be tolerated and should return 250 Ok
 	cmdCode(t, conn, "RSET", "250")
@@ -1052,6 +1070,11 @@ func TestMakeEHLOResponse(t *testing.T) {
 		t.Errorf("SIZE appears in the extension list with incorrect parameter %s, want %s", extensions["SIZE"], maxSizeStr)
 	}
 
+	// DSN should be listed as a supported extension.
+	if _, ok := extensions["DSN"]; !ok {
+		t.Errorf("DSN does not appear in the extension list")
+	}
+
 	// With no authentication handler configured, AUTH should not be advertised.
 	s.srv = &Server{}
 	extensions = parseExtensions(t, s.makeEHLOResponse())
@@ -1066,8 +1089,8 @@ func TestMakeEHLOResponse(t *testing.T) {
 		t.Errorf("AUTH does not appear in the extension list when an AuthHandler is specified")
 	}
 
-	reLogin := regexp.MustCompile("\\bLOGIN\\b")
-	rePlain := regexp.MustCompile("\\bPLAIN\\b")
+	reLogin := regexp.MustCompile(`\bLOGIN\b`)
+	rePlain := regexp.MustCompile(`\bPLAIN\b`)
 
 	// RFC 4954 specifies that, without TLS in use, plaintext authentication mechanisms must not be advertised.
 	s.tls = false
