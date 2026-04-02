@@ -1,220 +1,184 @@
 # smtpd
 
-> Maintenance note: the original repository is no longer being actively updated and is not accepting PRs. The fork has been adopted by [github.com/sibexico](https://github.com/sibexico), and it will continue to be updated and improved here. This README will be rewritten soon.
+Small, embeddable SMTP server library for Go, with an API style similar to the standard HTTP server.
 
-An SMTP server package written in Go, in the style of the built-in HTTP server. It meets the minimum requirements specified by RFC 2821 & 5321.
+This repository is maintained at [github.com/sibexico/smtpd](https://github.com/sibexico/smtpd). The canonical module path is:
 
-It is based on [Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtpd). The differences can be summarised as:
-
-* A simplified message handler
-* Changes made for RFC compliance
-* Testing has been added
-* Code refactoring
-* TLS support
-* RCPT handler
-* Authentication support
+```go
+import "github.com/sibexico/smtpd"
+```
 
 ## Features
 
-* A single message handler for simple mail handling with native data types.
-* RFC compliance. It implements the minimum command set, responds to commands and adds a valid Received header to messages as specified in RFC 2821 & 5321.
-* Customisable listening address and port. It defaults to listening on all addresses on port 25 if unset.
-* Customisable host name and application name. It defaults to the system hostname and "smtpd" application name if they are unset.
-* Easy to use TLS support that obeys RFC 3207.
-* Authentication support for the CRAM-MD5, LOGIN and PLAIN mechanisms that obeys RFC 4954.
+- SMTP server with simple message callback:
+  - `func(remoteAddr net.Addr, from string, to []string, data []byte) error`
+- Optional message-id callback:
+  - `func(remoteAddr net.Addr, from string, to []string, data []byte) (string, error)`
+- RFC-aligned command handling with enhanced status codes and `Received` header generation.
+- TLS support for STARTTLS and implicit TLS listeners.
+- STARTTLS-required mode helper for submission-style setups.
+- Authentication support for CRAM-MD5, LOGIN, and PLAIN.
+- Recipient policy hooks (`RCPT`) and mailbox verification hook (`VRFY`).
+- DSN-related ESMTP parameters:
+  - `MAIL FROM` supports `SIZE`, `RET`, `ENVID`
+  - `RCPT TO` supports `NOTIFY`, `ORCPT`
+- Configurable limits and behavior:
+  - `MaxSize`, `MaxRecipients`, `Timeout`, `DisableReverseDNS`, `XClientAllowed`
+- Graceful shutdown support via `Server.Shutdown(ctx)`.
 
-## Usage
-
-In general: create the server and pass a handler function to it as for the HTTP server. The server function has the following definition:
-
-```go
-func ListenAndServe(addr string, handler Handler, appname string, hostname string) error
-```
-
-For TLS support, add the paths to the certificate and key files as for the HTTP server.
-
-```go
-func ListenAndServeTLS(addr string, certFile string, keyFile string, handler Handler, appname string, hostname string) error
-```
-
-The handler function must have the following definition:
-
-```go
-func handler(remoteAddr net.Addr, from string, to []string, data []byte) error
-```
-
-The parameters are:
-
-* remoteAddr: remote end of the TCP connection i.e. the mail client's IP address and port.
-* from: the email address sent by the client in the MAIL command.
-* to: the set of email addresses sent by the client in the RCPT command.
-* data: the raw bytes of the mail message.
-
-## TLS Support
-
-SMTP over TLS works slightly differently to how you might expect if you are used to the HTTP protocol. Some helpful links for background information are:
-
-* [SSL vs TLS vs STARTTLS](https://www.fastmail.com/help/technical/ssltlsstarttls.html)
-* [Opportunistic TLS](https://en.wikipedia.org/wiki/Opportunistic_TLS)
-* [RFC 2487: SMTP Service Extension for Secure SMTP over TLS](https://tools.ietf.org/html/rfc2487)
-* [func (*Client) StartTLS](https://golang.org/pkg/net/smtp/#Client.StartTLS)
-
-The TLS support has three server configuration options. The bare minimum requirement to enable TLS is to supply certificate and key files as in the TLS example below.
-
-* TLSConfig
-
-This option allows custom TLS configurations such as [requiring strong ciphers](https://cipherli.st/) or using other certificate creation methods. If a certificate file and a key file are supplied to the ConfigureTLS function, the default TLS configuration for Go will be used. The default value for TLSConfig is nil, which disables TLS support.
-
-* TLSRequired
-
-This option sets whether TLS is optional or required. If set to true, the only allowed commands are NOOP, EHLO, STARTTLS and QUIT (as specified in RFC 3207) until the connection is upgraded to TLS i.e. until STARTTLS is issued. This option is ignored if TLS is not configured i.e. if TLSConfig is nil. The default is false.
-
-* TLSListener
-
-This option sets whether the listening socket requires an immediate TLS handshake after connecting. It is equivalent to using HTTPS in web servers, or the now defunct SMTPS on port 465. This option is ignored if TLS is not configured i.e. if TLSConfig is nil. The default is false.
-
-There is also a related package configuration option.
-
-* Debug
-
-This option determines if the data being read from or written to the client will be logged. This may help with debugging when using encrypted connections. The default is false.
-
-## Authentication Support
-
-The authentication support offers three mechanisms (CRAM-MD5, LOGIN and PLAIN) and has three server configuration options. The bare minimum requirement to enable authentication is to supply an authentication handler function as in the authentication example below.
-
-* AuthHandler
-
-This option provides an authentication handler function which is called to determine the validity of the supplied credentials.
-
-* AuthMechs
-
-This option allows the list of allowed authentication mechanisms to be explicitly set, overriding the default settings.
-
-* AuthRequired
-
-This option sets whether authentication is optional or required. If set to true, the only allowed commands are AUTH, EHLO, HELO, NOOP, RSET and QUIT (as specified in RFC 4954) until the session is authenticated. This option is ignored if authentication is not configured i.e. if AuthHandler is nil. The default is false.
-
-If both TLS and authentication are required, the TLS requirements take priority.
-
-### Notes
-
-RFC 4954 specifies that the LOGIN and PLAIN mechanisms require TLS to be in use as they send the password in plaintext. By default, smtpd follows this requirement, and will not advertise or allow LOGIN and PLAIN until a TLS connection is established. This behaviour can be overridden during testing by using the AuthMechs option. For example, to enable the PLAIN mechanism regardless of TLS:
-
-```go
-mechs := map[string]bool{"PLAIN": true}
-srv := &smtpd.Server{AuthMechs: mechs, ...}
-```
-
-The LOGIN and PLAIN mechanisms send the password to the server, but CRAM-MD5 does not - it sends a hash of the password, with a salt supplied by the server. In order to authenticate a session using CRAM-MD5, the server must have access to the plaintext password so it can hash it with the same salt and compare it to the hash sent by the client. If passwords are stored in a hashed format (and they should be), they cannot be transformed into plaintext, and therefore CRAM-MD5 cannot be used. To disable the CRAM-MD5 mechanism:
-
-```go
-mechs := map[string]bool{"CRAM-MD5": false}
-srv := &smtpd.Server{AuthMechs: mechs, ...}
-```
-
-The Go SMTP client cancels the authentication exchange by sending an asterisk to the server after a failed authentication attempt. The server will ignore this behaviour.
-
-## Example
-
-The following example code creates a new server with the name "MyServerApp" that listens on the localhost address and port 2525. Upon receipt of a new mail message, the handler function parses the mail and prints the subject header.
+## Quick Start
 
 ```go
 package main
 
 import (
-    "bytes"
     "log"
     "net"
-    "net/mail"
 
-    "github.com/mhale/smtpd"
+    "github.com/sibexico/smtpd"
 )
 
-func mailHandler(origin net.Addr, from string, to []string, data []byte) error {
-    msg, _ := mail.ReadMessage(bytes.NewReader(data))
-    subject := msg.Header.Get("Subject")
-    log.Printf("Received mail from %s for %s with subject %s", from, to[0], subject)
+func mailHandler(remoteAddr net.Addr, from string, to []string, data []byte) error {
+    log.Printf("mail from=%s to=%v bytes=%d remote=%s", from, to, len(data), remoteAddr.String())
     return nil
 }
 
 func main() {
-    smtpd.ListenAndServe("127.0.0.1:2525", mailHandler, "MyServerApp", "")
-}
-```
-
-## TLS Example
-
-Using the example code above, only the main function would be different to add TLS support.
-
-```go
-func main() {
-    smtpd.ListenAndServeTLS("127.0.0.1:2525", "/path/to/server.crt", "/path/to/server.key", mailHandler, "MyServerApp", "")
-}
-```
-
-This allows STARTTLS to be listed as a supported extension and allows clients to upgrade connections to TLS by sending a STARTTLS command.
-
-As the package level helper functions do not set the TLSRequired or TLSListener options for compatibility reasons, manual creation of a Server struct is necessary in order to use them.
-
-## RCPT Handler Example
-
-With the same ```mailHandler``` as above:
-
-```go
-func rcptHandler(remoteAddr net.Addr, from string, to string) bool {
-    domain = getDomain(to)
-    return domain == "mail.example.com"
-}
-
-func ListenAndServe(addr string, handler smtpd.Handler, rcpt smtpd.HandlerRcpt) error {
-    srv := &smtpd.Server{
-        Addr:        addr,
-        Handler:     handler,
-        HandlerRcpt: rcpt,
-        Appname:     "MyServerApp",
-        Hostname:    "",
+    err := smtpd.ListenAndServe("127.0.0.1:2525", mailHandler, "MyServer", "")
+    if err != nil {
+        log.Fatal(err)
     }
-    return srv.ListenAndServe()
 }
-
-ListenAndServe("127.0.0.1:2525", mailHandler, rcptHandler)
 ```
 
-## Authentication Example
+## TLS Modes
 
-With the same ```mailHandler``` as above:
+STARTTLS available (optional for clients):
 
 ```go
-func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, shared []byte) (bool, error) {
+err := smtpd.ListenAndServeTLS(
+    "127.0.0.1:2525",
+    "/path/to/server.crt",
+    "/path/to/server.key",
+    mailHandler,
+    "MyServer",
+    "mail.example.com",
+)
+```
+
+STARTTLS required before mail commands (typical submission behavior):
+
+```go
+err := smtpd.ListenAndServeSTARTTLS(
+    "127.0.0.1:587",
+    "/path/to/server.crt",
+    "/path/to/server.key",
+    mailHandler,
+    "MyServer",
+    "mail.example.com",
+)
+```
+
+Implicit TLS listener (SMTPS-style):
+
+```go
+err := smtpd.ListenAndServeTLSImplicit(
+    "127.0.0.1:465",
+    "/path/to/server.crt",
+    "/path/to/server.key",
+    mailHandler,
+    "MyServer",
+    "mail.example.com",
+)
+```
+
+If you need encrypted private keys, use `Server.ConfigureTLSWithPassphrase`.
+
+## Authentication
+
+Provide an `AuthHandler` to enable AUTH.
+
+```go
+authHandler := func(remoteAddr net.Addr, mechanism string, username, password, shared []byte) (bool, error) {
     return string(username) == "valid" && string(password) == "password", nil
 }
 
-func ListenAndServe(addr string, handler smtpd.Handler, authHandler smtpd.AuthHandler) error {
-    srv := &smtpd.Server{
-        Addr:        addr,
-        Handler:     handler,
-        Appname:     "MyServerApp",
-        Hostname:    "",
-        AuthHandler: authHandler,
-        AuthRequired: true,
-    }
-    return srv.ListenAndServe()
+srv := &smtpd.Server{
+    Addr:         "127.0.0.1:2525",
+    Appname:      "MyServer",
+    AuthHandler:  authHandler,
+    AuthRequired: true,
+    Handler:      mailHandler,
 }
 
-ListenAndServe("127.0.0.1:2525", mailHandler, authHandler)
+if err := srv.ListenAndServe(); err != nil {
+    log.Fatal(err)
+}
 ```
 
-This allows AUTH to be listed as a supported extension, CRAM-MD5 as a supported mechanism, and allows clients to authenticate by sending an AUTH command.
+Notes:
+
+- By default, LOGIN and PLAIN are only offered over TLS.
+- You can override allowed mechanisms with `AuthMechs` (for example in tests).
+- If both TLS and auth are required, TLS requirements are enforced first.
+
+## Recipient And VRFY Hooks
+
+```go
+srv := &smtpd.Server{
+    Addr:    "127.0.0.1:2525",
+    Handler: mailHandler,
+    HandlerRcpt: func(_ net.Addr, from, to string) bool {
+        _ = from
+        return strings.HasSuffix(strings.ToLower(to), "@mail.example.com")
+    },
+    HandlerVrfy: func(_ net.Addr, address string) (string, bool) {
+        if strings.EqualFold(address, "alias@example.com") {
+            return "recipient@example.com", true
+        }
+        return "", false
+    },
+}
+```
+
+`HandlerVrfy` is checked first for `VRFY`. If it is not set, `HandlerRcpt` is used as a fallback policy.
+
+## Server Configuration
+
+Main `Server` options used in practice:
+
+- `Addr`, `Appname`, `Hostname`
+- `Handler` or `MsgIDHandler`
+- `TLSConfig`, `TLSRequired`, `TLSListener`
+- `AuthHandler`, `AuthRequired`, `AuthMechs`
+- `HandlerRcpt`, `HandlerVrfy`
+- `MaxSize`, `MaxRecipients`, `Timeout`
+- `DisableReverseDNS`, `XClientAllowed`
+
+Graceful lifecycle helpers:
+
+- `Close()` to stop accepting new work immediately.
+- `Shutdown(ctx)` to stop listeners and wait for open sessions.
 
 ## Testing
 
-The tests cover the supported SMTP command set and line parsing. A single server is created listening on an ephemeral port (52525) for the duration of the tests. Each test creates a new client connection for processing commands.
+Run all tests:
 
-For the TLS, size and authentication tests, a different server is created with a net.Pipe connection inside each individual test, in order to change the server settings for each test.
+```bash
+go test ./...
+```
 
-The TLS and authentication support has also been manually tested with Go client code, Ruby client code, and macOS's Mail.app.
+The test suite covers command handling, TLS behavior, auth flows, size and line limits, shutdown semantics, parsing of extended SMTP parameters.
 
 ## Licensing
 
-Some of the code in this package was copied or adapted from code found in [Brad Fitzpatrick's go-smtpd](https://github.com/bradfitz/go-smtpd). As such, those sections of code are subject to their original copyright and license. The remaining code is in the public domain.
+The project is primarily released under [The Unlicense](https://unlicense.org) (see [LICENSE](LICENSE)).
+
+Some code was originally copied or adapted from [bradfitz/go-smtpd](https://github.com/bradfitz/go-smtpd). Those parts remain subject to the original upstream license terms where applicable.
+
+## History
+
+- The original SMTP server implementation was created in [bradfitz/go-smtpd](https://github.com/bradfitz/go-smtpd).
+- In 2014, [Mark Hale](https://github.com/mhale) started [mhale/smtpd](https://github.com/mhale/smtpd), expanding RFC compliance, tests, TLS, auth, and maintainability.
+- Over time, contributors added features such as configurable limits, graceful shutdown, reverse-DNS controls, message-id handler support, and XCLIENT support.
+- In this fork, development continues at [sibexico/smtpd](https://github.com/sibexico/smtpd), including recent protocol and TLS hardening work (for example STARTTLS-required helper, VRFY improvements, stricter MAIL/RCPT parameter parsing, DSN parameter handling, etc).
