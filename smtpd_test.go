@@ -181,6 +181,10 @@ func TestCmdMAIL(t *testing.T) {
 
 	// MAIL with valid SIZE parameter should return 250 Ok
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=7BIT", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SMTPUTF8", "250")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=8BITMIME SMTPUTF8 SIZE=1000", "250")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET=FULL", "250")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET=HDRS ENVID=track-123 SIZE=1000", "250")
 
@@ -190,6 +194,11 @@ func TestCmdMAIL(t *testing.T) {
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE= ", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=foo", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SIZE=1000 SIZE=1001", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> BODY=BINARYMIME", "501")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SMTPUTF8=YES", "502")
+	cmdCode(t, conn, "MAIL FROM:<sender@example.com> SMTPUTF8 SMTPUTF8", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET=ALL", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> RET", "501")
 	cmdCode(t, conn, "MAIL FROM:<sender@example.com> ENVID", "501")
@@ -1073,6 +1082,21 @@ func TestMakeEHLOResponse(t *testing.T) {
 	// DSN should be listed as a supported extension.
 	if _, ok := extensions["DSN"]; !ok {
 		t.Errorf("DSN does not appear in the extension list")
+	}
+
+	// PIPELINING should be listed as a supported extension.
+	if _, ok := extensions["PIPELINING"]; !ok {
+		t.Errorf("PIPELINING does not appear in the extension list")
+	}
+
+	// 8BITMIME should be listed as a supported extension.
+	if _, ok := extensions["8BITMIME"]; !ok {
+		t.Errorf("8BITMIME does not appear in the extension list")
+	}
+
+	// SMTPUTF8 should be listed as a supported extension.
+	if _, ok := extensions["SMTPUTF8"]; !ok {
+		t.Errorf("SMTPUTF8 does not appear in the extension list")
 	}
 
 	// With no authentication handler configured, AUTH should not be advertised.

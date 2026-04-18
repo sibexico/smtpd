@@ -361,11 +361,13 @@ type session struct {
 }
 
 type mailCmd struct {
-	from    string
-	size    int
-	hasSize bool
-	ret     string
-	envid   string
+	from     string
+	size     int
+	hasSize  bool
+	body     string
+	smtpUTF8 bool
+	ret      string
+	envid    string
 }
 
 type rcptCmd struct {
@@ -1094,8 +1096,17 @@ func parseMailCommand(args string) (cmd mailCmd, errResp string) {
 		key, value, hasKV := splitEsmtpParam(param)
 		if !hasKV {
 			switch strings.ToUpper(param) {
+			case "SMTPUTF8":
+				if seen["SMTPUTF8"] {
+					return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid SMTPUTF8 parameter)"
+				}
+				cmd.smtpUTF8 = true
+				seen["SMTPUTF8"] = true
+				continue
 			case "SIZE":
 				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)"
+			case "BODY":
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid BODY parameter)"
 			case "RET":
 				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid RET parameter)"
 			case "ENVID":
@@ -1126,6 +1137,12 @@ func parseMailCommand(args string) (cmd mailCmd, errResp string) {
 			}
 			cmd.hasSize = true
 			cmd.size = size
+		case "BODY":
+			body := strings.ToUpper(value)
+			if body != "7BIT" && body != "8BITMIME" {
+				return cmd, "501 5.5.4 Syntax error in parameters or arguments (invalid BODY parameter)"
+			}
+			cmd.body = body
 		case "RET":
 			ret := strings.ToUpper(value)
 			if ret != "FULL" && ret != "HDRS" {
@@ -1296,11 +1313,20 @@ func (s *session) authMechs() (mechs map[string]bool) {
 func (s *session) makeEHLOResponse() (response string) {
 	response = fmt.Sprintf("250-%s greets %s\r\n", s.srv.Hostname, s.remoteName)
 
+	// RFC 2920 command pipelining extension.
+	response += "250-PIPELINING\r\n"
+
 	// RFC 1870 specifies that "SIZE 0" indicates no maximum size is in force.
 	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
 
+	// RFC 6152 extension for 8-bit MIME transport.
+	response += "250-8BITMIME\r\n"
+
 	// RFC 3461 Delivery Status Notification extension.
 	response += "250-DSN\r\n"
+
+	// RFC 6531 extension for internationalized email over SMTP.
+	response += "250-SMTPUTF8\r\n"
 
 	// Only list STARTTLS if TLS is configured, but not currently in use.
 	if s.srv.TLSConfig != nil && !s.tls {
